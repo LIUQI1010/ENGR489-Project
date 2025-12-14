@@ -28,9 +28,11 @@ def extract_table_identifiers(token_stream):
     for item in token_stream:
         if isinstance(item, IdentifierList):
             for identifier in item.get_identifiers():
-                yield identifier.get_real_name()
+                alias = identifier.get_alias()
+                yield alias if alias else identifier.get_real_name()
         elif isinstance(item, Identifier):
-            yield item.get_real_name()
+            alias = item.get_alias()
+            yield alias if alias else item.get_real_name()
         elif item.ttype is Keyword:
             yield item.value
 

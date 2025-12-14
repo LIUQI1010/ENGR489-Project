@@ -9,7 +9,7 @@ from deap import base, creator, gp, tools, algorithms
 from copy import deepcopy
 
 # =========================
-#  选择率与行数加载
+#  选择率与行数加载（保持不变）
 # =========================
 def load_selectivity_with_rows(xlsx_path):
     df = pd.read_excel(xlsx_path, header=None)
@@ -28,7 +28,7 @@ def load_selectivity_with_rows(xlsx_path):
     return selectivity_map, table_rows
 
 # =========================
-#  GP 基元：JOIN 树
+#  GP 基元：JOIN 树（保持不变）
 # =========================
 def join_tables(a, b):
     return ("JOIN", a, b)
@@ -40,7 +40,7 @@ def create_pset(table_list):
         pset.addTerminal(table, name=str(table))
     return pset
 
-# 随机生成保持“每表恰好一次”的初始 JOIN 树（随机形状）
+# 随机生成保持“每表恰好一次”的初始 JOIN 树（随机形状）（保持不变）
 def generate_expr_unique_terminals(pset, table_list, rng):
     shuffled = rng.sample(table_list, len(table_list))
 
@@ -74,7 +74,7 @@ def generate_expr_connected(pset, table_list, allowed_edges, rng):
     return gp.PrimitiveTree.from_string(expr_str, pset)
 
 # =========================
-#  树解析/重建/叶序
+#  树解析/重建/叶序（保持不变）
 # =========================
 def parse_gp_str(expr_str: str):
     expr_str = expr_str.strip()
@@ -125,210 +125,155 @@ def get_leaf_order_from_ind(individual):
     return leaves_inorder(parse_gp_str(str(individual)))
 
 # =========================
-#  变异
+#  变异（保持为“与父旋转”的 mutate2）
 # =========================
 def mutate_individual(individual, pset, table_list, max_tries=10):
-    ind = gp.PrimitiveTree(individual)
-    internal_idxs = [i for i, node in enumerate(ind) if getattr(node, "arity", 0) > 0]
-    if not internal_idxs:
-        return creator.Individual(ind),
-    idx = random.choice(internal_idxs)
-    sl = ind.searchSubtree(idx)
-    sub_terms = [node.name for node in ind[sl] if getattr(node, "arity", 0) == 0]
-    sub_terms = list(dict.fromkeys(sub_terms))
-    if len(sub_terms) <= 1:
-        return creator.Individual(ind),
+    """
+    论文的 mutate2 思想：随机挑一个内部节点，与其父节点做一次旋转（左旋/右旋），
+    结构微调，不改变叶集合。失败则原样返回。
+    """
+    def _get_sub(t, path):
+        if not path:
+            return t
+        _, l, r = t
+        return _get_sub(l, path[1:]) if path[0] == 'L' else _get_sub(r, path[1:])
 
-    def build_expr(names):
-        if len(names) == 1:
-            return names[0]
-        split = random.randint(1, len(names) - 1)
-        left = build_expr(names[:split])
-        right = build_expr(names[split:])
-        return f"join_tables({left}, {right})"
+    def _set_sub(t, path, new_sub):
+        if not path:
+            return new_sub
+        _, l, r = t
+        if path[0] == 'L':
+            return ("JOIN", _set_sub(l, path[1:], new_sub), r)
+        else:
+            return ("JOIN", l, _set_sub(r, path[1:], new_sub))
+
+    def _list_internal_paths(t, path=()):
+        if isinstance(t, str):
+            return []
+        _, l, r = t
+        paths = [path]
+        paths += _list_internal_paths(l, path + ('L',))
+        paths += _list_internal_paths(r, path + ('R',))
+        return paths
+
+    def _rotate_with_parent(t, target_path):
+        if not target_path:
+            return None  # 根无父
+        parent_path = target_path[:-1]
+        is_left = (target_path[-1] == 'L')
+        parent = _get_sub(t, parent_path)
+        if isinstance(parent, str):
+            return None
+        _, A, B = parent  # parent = ("JOIN", A, B)
+
+        target = A if is_left else B
+        if isinstance(target, str):
+            return None
+        _, x, y = target  # target = ("JOIN", x, y)
+
+        if is_left:
+            # 右旋：( (x,y), B ) -> ( x, (y,B) )
+            new_parent = ("JOIN", x, ("JOIN", y, B))
+        else:
+            # 左旋：( A, (x,y) ) -> ( (A,x), y )
+            new_parent = ("JOIN", ("JOIN", A, x), y)
+
+        return _set_sub(t, parent_path, new_parent)
+
+    t = parse_gp_str(str(individual))
+    internal_paths = [p for p in _list_internal_paths(t) if len(p) > 0]  # 非根
+    if not internal_paths:
+        return creator.Individual(gp.PrimitiveTree(individual)),
 
     tries = 0
     while tries < max_tries:
         tries += 1
-        new_order = random.sample(sub_terms, len(sub_terms))
-        if new_order == sub_terms:
-            new_order = sub_terms[1:] + sub_terms[:1]
-        expr_str = build_expr(new_order)
-        new_sub = gp.PrimitiveTree.from_string(expr_str, pset)
-        test_ind = gp.PrimitiveTree(ind)
-        test_ind[sl] = new_sub
-        if str(test_ind) != str(ind):
-            ind = test_ind
-            break
-    return creator.Individual(ind),
+        p = random.choice(internal_paths)
+        new_t = _rotate_with_parent(t, p)
+        if new_t is not None and tuple_to_expr_str(new_t) != tuple_to_expr_str(t):
+            expr = gp.PrimitiveTree.from_string(tuple_to_expr_str(new_t), pset)
+            return creator.Individual(expr),
+    return creator.Individual(gp.PrimitiveTree(individual)),
 
 # =========================
-#  交叉
+#  论文式 φ-交叉：工具函数
 # =========================
-def ox_crossover(order1, order2):
-    size = len(order1)
-    a, b = sorted(random.sample(range(size), 2))
-    hole = set(order1[a:b])
-    res = [None] * size
-    res[a:b] = order1[a:b]
-    idx = b
-    for elem in order2:
-        if elem not in hole:
-            if idx >= size:
-                idx = 0
-            res[idx] = elem
-            idx += 1
-    return res
+def leaves_set(node):
+    if isinstance(node, str):
+        return {node}
+    _, l, r = node
+    return leaves_set(l) | leaves_set(r)
 
-def internal_subtrees(expr_tuple):
-    lst = []
-    def rec(node):
-        if isinstance(node, str):
-            return
-        lst.append(node)
-        rec(node[1]); rec(node[2])
-    rec(expr_tuple)
-    return lst
-
-def pick_random_subtree_span(expr_tuple, *, forbid_full=True):
-    internals = internal_subtrees(expr_tuple)
-    full_leaves = leaves_inorder(expr_tuple)
-    total = len(full_leaves)
-
-    if forbid_full:
-        candidates = []
-        for sub in internals:
-            if len(leaves_inorder(sub)) < total:
-                candidates.append(sub)
-    else:
-        candidates = internals[:]
-
-    if not candidates:
-        a = random.randrange(total)
-        return (a, a+1), {full_leaves[a]}
-
-    sub = random.choice(candidates)
-    sub_leaves = leaves_inorder(sub)
-    a = full_leaves.index(sub_leaves[0])
-    b = a + len(sub_leaves)
-    return (a, b), set(sub_leaves)
-
-def ox_crossover_with_span(order1, order2, span):
-    size = len(order1)
-    a, b = span
-    hole = set(order1[a:b])
-    res = [None] * size
-    res[a:b] = order1[a:b]
-    idx = b
-    for e in order2:
-        if e not in hole:
-            if idx >= size:
-                idx = 0
-            res[idx] = e
-            idx += 1
-    return res, span
-
-def enumerate_subtrees_with_paths(t):
+def postorder_join_descriptors(t):
+    """
+    返回按后序的 join 描述列表：每个元素是 (Lset, Rset)，
+    其中 Lset/Rset 是该 join 左/右子树的叶集合（集合对象、可作匹配键）。
+    """
     out = []
-    def rec(node, path):
-        if isinstance(node, str):
-            out.append((path, node, frozenset([node])))
-            return frozenset([node])
-        _, l, r = node
-        L = rec(l, path + ('L',))
-        R = rec(r, path + ('R',))
-        s = L | R
-        out.append((path, node, s))
-        return s
-    rec(t, ())
+    def rec(n):
+        if isinstance(n, str):
+            return
+        _, l, r = n
+        rec(l); rec(r)
+        out.append((frozenset(leaves_set(l)), frozenset(leaves_set(r))))
+    rec(t)
     return out
 
-def replace_subtree_at_path(t, path, new_subtree):
-    if len(path) == 0:
-        return new_subtree
-    _, l, r = t
-    if path[0] == 'L':
-        return ("JOIN", replace_subtree_at_path(l, path[1:], new_subtree), r)
-    else:
-        return ("JOIN", l, replace_subtree_at_path(r, path[1:], new_subtree))
+def descriptors_for_subtree(t):
+    return set(postorder_join_descriptors(t))
 
-def _crossover_swap_matching_subtrees_with_info(ind1, ind2, pset,
-                                                forbid_full=True,
-                                                prefer_largest=True,
-                                                min_leaf_count=2):
-    t1 = parse_gp_str(str(ind1))
-    t2 = parse_gp_str(str(ind2))
-    leaves1 = frozenset(leaves_inorder(t1))
-    leaves2 = frozenset(leaves_inorder(t2))
-    if leaves1 != leaves2:
+def phi_rebuild(nodelist, T_set):
+    """
+    论文 φ 算子：逐步从 T_set 取出与 (Lset,Rset) 匹配的两棵树，组合为新 JOIN 树。
+    """
+    def keyset(tree):
+        return frozenset(leaves_set(tree))
+
+    pool = {}
+    def push(tree):
+        pool.setdefault(keyset(tree), []).append(tree)
+    def pop_exact(key):
+        lst = pool.get(key, [])
+        if not lst:
+            return None
+        return lst.pop()
+
+    for t in T_set:
+        push(t)
+
+    for (Lset, Rset) in nodelist:
+        A = pop_exact(Lset)
+        B = pop_exact(Rset)
+        if A is None or B is None:
+            return None
+        push(("JOIN", A, B))
+
+    # 最后应只剩 1 棵树
+    leftover = None
+    for lst in pool.values():
+        for el in lst:
+            if leftover is None:
+                leftover = el
+            else:
+                return None
+    return leftover
+
+def pick_random_proper_subtree(t):
+    subs = []
+    def rec(n, is_root):
+        if isinstance(n, str):
+            return
+        _, l, r = n
+        if not is_root:
+            subs.append(n)
+        rec(l, False); rec(r, False)
+    rec(t, True)
+    if not subs:
         return None
-
-    subs1 = enumerate_subtrees_with_paths(t1)
-    subs2 = enumerate_subtrees_with_paths(t2)
-
-    m1, m2 = {}, {}
-    for path, subtree, s in subs1:
-        m1.setdefault(s, []).append((path, subtree))
-    for path, subtree, s in subs2:
-        m2.setdefault(s, []).append((path, subtree))
-
-    candidates = set(m1.keys()) & set(m2.keys())
-    if forbid_full:
-        candidates.discard(leaves1)
-    if min_leaf_count is not None and min_leaf_count > 1:
-        candidates = {s for s in candidates if len(s) >= min_leaf_count}
-    if not candidates:
-        return None
-
-    key = max(candidates, key=lambda s: len(s)) if prefer_largest else random.choice(list(candidates))
-    path1, sub1 = random.choice(m1[key])
-    path2, sub2 = random.choice(m2[key])
-
-    new_t1 = replace_subtree_at_path(t1, path1, sub2)
-    new_t2 = replace_subtree_at_path(t2, path2, sub1)
-    expr1 = gp.PrimitiveTree.from_string(tuple_to_expr_str(new_t1), pset)
-    expr2 = gp.PrimitiveTree.from_string(tuple_to_expr_str(new_t2), pset)
-    child1 = creator.Individual(expr1)
-    child2 = creator.Individual(expr2)
-    return child1, child2, set(key)
-
-def crossover_matching_or_ox(ind1, ind2, pset, table_list,
-                             *,
-                             forbid_full=True,
-                             prefer_largest=True,
-                             min_leaf_count=2,
-                             forbid_full_subtree=True):
-    try:
-        res = _crossover_swap_matching_subtrees_with_info(
-            ind1, ind2, pset,
-            forbid_full=forbid_full,
-            prefer_largest=prefer_largest,
-            min_leaf_count=min_leaf_count
-        )
-        if res is not None:
-            c1, c2, _ = res
-            return c1, c2
-    except Exception:
-        pass
-    return crossover_individuals(ind1, ind2, pset, table_list, forbid_full_subtree=forbid_full_subtree)
-
-def crossover_individuals(ind1, ind2, pset, table_list, *, forbid_full_subtree=True):
-    shape1 = parse_gp_str(str(ind1))
-    shape2 = parse_gp_str(str(ind2))
-    order1 = leaves_inorder(shape1)
-    order2 = leaves_inorder(shape2)
-    span1, _ = pick_random_subtree_span(shape1, forbid_full=forbid_full_subtree)
-    span2, _ = pick_random_subtree_span(shape2, forbid_full=forbid_full_subtree)
-    child1_order, _ = ox_crossover_with_span(order1, order2, span1)
-    child2_order, _ = ox_crossover_with_span(order2, order1, span2)
-    c1_tuple = fill_leaves_with_order(shape1, iter(child1_order))
-    c2_tuple = fill_leaves_with_order(shape2, iter(child2_order))
-    expr1 = gp.PrimitiveTree.from_string(tuple_to_expr_str(c1_tuple), pset)
-    expr2 = gp.PrimitiveTree.from_string(tuple_to_expr_str(c2_tuple), pset)
-    return creator.Individual(expr1), creator.Individual(expr2)
+    return random.choice(subs)
 
 # =========================
-#  代价构件：选择率乘积 / 不连通惩罚
+#  连通/有效性相关（保持不变）
 # =========================
 def _tabs(node):
     if isinstance(node, str):
@@ -339,22 +284,104 @@ def build_allowed_edges(selectivity_map, table_list):
     tables = set(table_list)
     return {pair for pair in selectivity_map.keys() if all(t in tables for t in pair)}
 
+def _has_allowed_edge_between_sets(left_tabs, right_tabs, allowed_edges):
+    for l in left_tabs:
+        for r in right_tabs:
+            if frozenset([l, r]) in allowed_edges:
+                return True
+    return False
+
+def count_disconnected_joins(tree, allowed_edges):
+    if isinstance(tree, str):
+        return 0
+    _, L, R = tree
+    left_tabs = _tabs(L); right_tabs = _tabs(R)
+    bad = 0 if _has_allowed_edge_between_sets(left_tabs, right_tabs, allowed_edges) else 1
+    return bad + count_disconnected_joins(L, allowed_edges) + count_disconnected_joins(R, allowed_edges)
+
+# =========================
+#  论文式 φ-交叉（严格版）：始终产出“有效树”
+# =========================
+def gp_crossover_phi_strict(ind1, ind2, pset, allowed_edges,
+                            max_tries=40, min_leaf_count=2):
+    """
+    论文定义：
+      NG1 := φ( postorder(T1) - postorder(S2), {S2} ∪ (leaves(T1) - leaves(S2)) )
+      NG2 := φ( postorder(T2) - postorder(S1), {S1} ∪ (leaves(T2) - leaves(S1)) )
+    严格性：重复采样 S1,S2，确保 φ 成功且 new 树没有“断连 join”（不产生 cross product）。
+    多次失败则返回父代（no-op）。
+    """
+    T1 = parse_gp_str(str(ind1))
+    T2 = parse_gp_str(str(ind2))
+
+    # 叶集合必须一致（你的初始化已保证）
+    if frozenset(leaves_inorder(T1)) != frozenset(leaves_inorder(T2)):
+        return creator.Individual(gp.PrimitiveTree(ind1)), creator.Individual(gp.PrimitiveTree(ind2))
+
+    def _valid_leafset(tree):
+        used = get_all_tables(tree)
+        return len(used) == len(set(used)) and set(used) == set(leaves_inorder(T1))
+
+    tries = 0
+    while tries < max_tries:
+        tries += 1
+
+        S1 = pick_random_proper_subtree(T1)
+        S2 = pick_random_proper_subtree(T2)
+        if (S1 is None) or (S2 is None):
+            continue
+        if min_leaf_count is not None:
+            if len(leaves_set(S1)) < min_leaf_count or len(leaves_set(S2)) < min_leaf_count:
+                continue
+
+        desc_T1 = postorder_join_descriptors(T1)
+        desc_S2 = descriptors_for_subtree(S2)
+        nodelist1 = [d for d in desc_T1 if d not in desc_S2]
+        leaves_T1 = leaves_set(T1)
+        leaves_S2 = leaves_set(S2)
+        Tset1 = [S2] + [t for t in leaves_T1 - leaves_S2]
+
+        desc_T2 = postorder_join_descriptors(T2)
+        desc_S1 = descriptors_for_subtree(S1)
+        nodelist2 = [d for d in desc_T2 if d not in desc_S1]
+        leaves_T2 = leaves_set(T2)
+        leaves_S1 = leaves_set(S1)
+        Tset2 = [S1] + [t for t in leaves_T2 - leaves_S1]
+
+        NG1_tuple = phi_rebuild(nodelist1, Tset1)
+        NG2_tuple = phi_rebuild(nodelist2, Tset2)
+
+        if (NG1_tuple is None) or (NG2_tuple is None):
+            continue
+        if not (_valid_leafset(NG1_tuple) and _valid_leafset(NG2_tuple)):
+            continue
+        # 严格：不允许断连（等价于论文“无 cross product / 无人工 join”的有效性要求）
+        if count_disconnected_joins(NG1_tuple, allowed_edges) != 0:
+            continue
+        if count_disconnected_joins(NG2_tuple, allowed_edges) != 0:
+            continue
+
+        expr1 = gp.PrimitiveTree.from_string(tuple_to_expr_str(NG1_tuple), pset)
+        expr2 = gp.PrimitiveTree.from_string(tuple_to_expr_str(NG2_tuple), pset)
+        return creator.Individual(expr1), creator.Individual(expr2)
+
+    # 多次尝试失败：不做交叉（与论文“保持有效性”的精神一致）
+    return creator.Individual(gp.PrimitiveTree(ind1)), creator.Individual(gp.PrimitiveTree(ind2))
+
+# =========================
+#  代价构件：选择率乘积 / 不连通惩罚（保持不变）
+# =========================
 def _crossing_selectivity_product(left_subtree, right_subtree, selectivity_map, allowed_edges):
-    """
-    计算跨越左右子树的最佳选择率
-    修改：从选择率乘积改为选择最优连接（选择率最大 = 成本最低）
-    """
     L = _tabs(left_subtree); R = _tabs(right_subtree)
-    best_sel = None
+    sel = 1.0
+    has = False
     for l in L:
         for r in R:
             k = frozenset([l, r])
             if k in allowed_edges:
-                sel = selectivity_map.get(k, 1.0)
-                # 选择最佳连接（选择率最大 = 成本最低）
-                if best_sel is None or sel > best_sel:
-                    best_sel = sel
-    return best_sel
+                has = True
+                sel *= selectivity_map.get(k, 1.0)
+    return sel if has else None
 
 def _anchor_penalty(left_subtree, right_subtree):
     """ domain-agnostic: 不对特定表做惩罚，返回 1.0 """
@@ -404,7 +431,7 @@ def sum_join_outputs(tree, selectivity_map, table_rows, allowed_edges=None, disc
     return rows_out, total_sum
 
 # =========================
-#  SQL 解析 / 基数前移近似
+#  SQL 解析 / 基数前移近似（保持不变）
 # =========================
 def load_all_sql_queries(folder_path):
     sql_queries = {}
@@ -440,23 +467,8 @@ def apply_base_filters(table_rows, query_info):
     return dict(table_rows)
 
 # =========================
-#  连通初始化/修复 相关辅助（稳健版）
+#  连通初始化/修复 相关辅助（保持不变）
 # =========================
-def _has_allowed_edge_between_sets(left_tabs, right_tabs, allowed_edges):
-    for l in left_tabs:
-        for r in right_tabs:
-            if frozenset([l, r]) in allowed_edges:
-                return True
-    return False
-
-def count_disconnected_joins(tree, allowed_edges):
-    if isinstance(tree, str):
-        return 0
-    _, L, R = tree
-    left_tabs = _tabs(L); right_tabs = _tabs(R)
-    bad = 0 if _has_allowed_edge_between_sets(left_tabs, right_tabs, allowed_edges) else 1
-    return bad + count_disconnected_joins(L, allowed_edges) + count_disconnected_joins(R, allowed_edges)
-
 def build_greedy_connected_order(table_list, allowed_edges, start=None):
     # 按 SQL 解析顺序保序去重
     tabs = list(dict.fromkeys(table_list))
@@ -520,11 +532,11 @@ def repair_individual_connected(individual, pset, table_list, allowed_edges):
     return creator.Individual(expr)
 
 # =========================
-#  优化主流程（含：连通初始化/修复、退火惩罚、早停、防 inf）
+#  优化主流程（保持不变，仅 mate 改为严格 φ-交叉）
 # =========================
 def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)",
                    seed=None, summary_file="summary_best_results_seeds.csv", log_dir="logs_seeds"):
-    # ---- 控制参数 ----
+    # ---- 控制参数（保持不变） ----
     EARLY_STOP = False
     PATIENCE = 15
     MIN_DELTA_REL = 1e-3
@@ -560,7 +572,7 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
 
     toolbox = base.Toolbox()
     toolbox.register("clone", deepcopy)
-    # 初始化：尽量连通
+    # 初始化：尽量连通（保持不变）
     import hashlib
 
     # 为每个初始个体分配稳定的局部 RNG：受 (filename, seed, 个体序号) 决定
@@ -627,23 +639,17 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
 
     toolbox.register("evaluate", eval_cost)
     toolbox.register("select", tools.selTournament, tournsize=TOURN)
-    toolbox.register(
-        "mate",
-        crossover_matching_or_ox,
-        pset=pset,
-        table_list=table_list,
-        forbid_full=True,
-        prefer_largest=True,
-        min_leaf_count=3,
-        forbid_full_subtree=True,
-    )
+
+    # === mate：改为“严格 φ-交叉”，不再回退到 cxOnePoint；失败则 no-op ===
+    toolbox.register("mate", gp_crossover_phi_strict, pset=pset, allowed_edges=allowed_edges)
+
     toolbox.register("expr_mut", gp.genFull, min_=0, max_=5)
     toolbox.register("mutate", mutate_individual, pset=pset, table_list=table_list)
 
     print(f"\n🧪 Optimizing Query: {filename} | Seed: {seed}  (Tables: {table_list})")
     pop = toolbox.population(n=POP_SIZE)
 
-    # 初始化后做一次连通修复 + 合法性保障
+    # 初始化后做一次连通修复 + 合法性保障（保持不变）
     def _legalize(ind):
         try:
             ind2 = repair_individual_connected(ind, pset, table_list, allowed_edges)
@@ -669,7 +675,15 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
     # 记录第0代种群中的最优解
     gen0_best = min(pop, key=lambda x: x.fitness.values[0] if x.fitness.valid else float('inf'))
     gen0_best_cost = gen0_best.fitness.values[0] if gen0_best.fitness.valid else toolbox.evaluate(gen0_best)[0]
-    gen0_best_tree = parse_gp_str(str(gen0_best))
+    raw0 = parse_gp_str(str(gen0_best))
+    
+    # 与后续 logging 对齐：如叶集合不合法，尝试修复一次
+    if not _valid_leafset(raw0):
+        fixed0 = _try_repair_leafset(raw0)
+        gen0_best_tree = fixed0 if fixed0 is not None else raw0
+    else:
+        gen0_best_tree = raw0
+        
     log_data.append(
         (seed, 0, gen0_best_cost, tuple_to_expr_str(gen0_best_tree), ",".join(get_all_tables(gen0_best_tree)))
     )
@@ -691,7 +705,7 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
         parents = toolbox.select(pop, k=mu)
         offspring = algorithms.varOr(parents, toolbox, lambda_=lmbda, cxpb=CXPB, mutpb=MUTPB)
 
-        # 交叉/变异后：连通修复 + 合法化
+        # 交叉/变异后：连通修复 + 合法化（保持不变）
         new_offspring = []
         for ind in offspring:
             try:
@@ -714,7 +728,7 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
 
         pop = offspring
 
-        # 精英注入
+        # 精英注入（保持不变）
         if len(hof) > 0:
             inj = min(ELITE_NUM, len(hof), len(pop))
             pop[:inj] = [deepcopy(h) for h in hof[:inj]]
@@ -724,12 +738,19 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
         # 记录当前代种群中的最优解（而不是历史最优）
         current_best = min(pop, key=lambda x: x.fitness.values[0] if x.fitness.valid else float('inf'))
         current_best_cost = current_best.fitness.values[0] if current_best.fitness.valid else toolbox.evaluate(current_best)[0]
-        current_best_tuple = parse_gp_str(str(current_best))
+        raw = parse_gp_str(str(current_best))
+        if not _valid_leafset(raw):
+            fixed = _try_repair_leafset(raw)
+            current_best_tuple = fixed if fixed is not None else raw
+        else:
+            current_best_tuple = raw
+
         current_best_tables = get_all_tables(current_best_tuple)
         log_data.append((seed, gen, current_best_cost, tuple_to_expr_str(current_best_tuple), ",".join(current_best_tables)))
 
-        # === Early stopping (disabled when EARLY_STOP=False) ===
+        # Early stopping （保持不变；默认不启用）
         if EARLY_STOP:
+            import math
             if best_seen is None or not math.isfinite(best_seen):
                 best_seen = current_best_cost
                 no_improve = 0
@@ -740,14 +761,14 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
                     best_seen = current_best_cost
                     no_improve = 0
                 else:
+                    MIN_EARLY_GEN = 10
                     if gen >= MIN_EARLY_GEN:
                         no_improve += 1
                         if no_improve >= PATIENCE:
                             print(f"[EARLY-STOP] {filename} seed={seed} at gen {gen}, best={best_seen:.6g}")
                             break
-        # EARLY_STOP=False 时不做任何事，必跑满 NGEN=50
 
-    # 写日志
+    # 写日志（结构不变）
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, f"{filename}_seed{seed}_log.csv")
     with open(log_file, "w", newline="", encoding="utf-8") as f:
@@ -755,10 +776,15 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
         writer.writerow(["Seed", "Generation", "Best_Cost", "Best_Join_Tree_Str", "Used_Tables"])
         writer.writerows(log_data)
 
-    # 汇总
+    # 汇总（结构不变）
     new_summary = not os.path.exists(summary_file)
     best = hof[0]
-    best_tree_tuple = parse_gp_str(str(best))
+    raw = parse_gp_str(str(best))
+    if not _valid_leafset(raw):
+        fixed = _try_repair_leafset(raw)
+        best_tree_tuple = fixed if fixed is not None else raw
+    else:
+        best_tree_tuple = raw
     best_cost = eval_cost(best)[0] if not best.fitness.valid else best.fitness.values[0]
     best_tables = get_all_tables(best_tree_tuple)
     tree_str = tuple_to_expr_str(best_tree_tuple)
@@ -769,7 +795,7 @@ def optimize_query(query_info, selectivity_map, table_rows, filename="(unknown)"
         writer.writerow([filename, seed, best_cost, tree_str, ",".join(best_tables)])
 
 # =========================
-#  主执行：30 个随机 seed
+#  主执行（输出文件名保持“baseline”）
 # =========================
 if __name__ == "__main__":
     # 注意：不固定全局随机种子；每次运行都会抽取新的 30 个 seed
@@ -789,7 +815,7 @@ if __name__ == "__main__":
         print("错误: seeds_used.txt 文件不存在，请确保该文件存在并包含种子值")
         exit(1)
 
-    # 多 seed × 多查询运行
+    # 多 seed × 多查询运行 —— baseline 区分文件名不变
     for filename, query_info in all_queries.items():
         for s in seeds:
             try:
@@ -797,8 +823,8 @@ if __name__ == "__main__":
                     query_info, selectivity_map, table_rows,
                     filename=filename,
                     seed=s,
-                    summary_file="summary_best_results_seeds.csv",
-                    log_dir="logs_seeds"
+                    summary_file="summary_best_results_seeds_baseline.csv",
+                    log_dir="logs_seeds_baseline"
                 )
             except Exception as e:
-                print(f"[ERROR] Optimizing {filename} with seed {s} failed: {e}")
+                print(f"[BASELINE-ERROR] Optimizing {filename} with seed {s} failed: {e}")

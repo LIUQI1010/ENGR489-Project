@@ -32,38 +32,58 @@ def get_all_tables(subtree):
         return get_all_tables(subtree[1]) + get_all_tables(subtree[2])
     return []
 
-# === NATURAL-join 的“min 简化规则”：跨边所有表对取最小 sel；无则 1.0 ===
-def _sel_min_rule(left_subtree, right_subtree, selectivity_map):
-    def tabs(t):
-        if isinstance(t, str): return [t]
-        return tabs(t[1]) + tabs(t[2])
-    Ltabs = tabs(left_subtree)
-    Rtabs = tabs(right_subtree)
-    vals = []
-    for l in Ltabs:
-        for r in Rtabs:
+# === 辅助：列出一个节点所有叶子（左→右） ===
+def _tabs(node):
+    if isinstance(node, str):
+        return [node]
+    return _tabs(node[1]) + _tabs(node[2])
+
+# === 允许的连边集合（仅限本次查询涉及的表） ===
+def build_allowed_edges(selectivity_map, table_list):
+    tables = set(table_list)
+    return {pair for pair in selectivity_map.keys() if all(t in tables for t in pair)}
+
+# === CHANGE: 用“跨边选择率连乘 + 无边断连惩罚”来与 GP 保持一致 ===
+def _crossing_selectivity_product(left_subtree, right_subtree, selectivity_map, allowed_edges):
+    L = _tabs(left_subtree)
+    R = _tabs(right_subtree)
+    sel = 1.0
+    has = False
+    for l in L:
+        for r in R:
             k = frozenset([l, r])
-            if k in selectivity_map:
-                vals.append(selectivity_map[k])
-    return min(vals) if vals else 1.0
+            if k in allowed_edges:
+                has = True
+                sel *= selectivity_map.get(k, 1.0)
+    return sel if has else None  # 无任何可连边则返回 None
 
 # === 计算：返回 (final_rows, total_generated_rows) ===
-def sum_join_outputs(tree, selectivity_map, table_rows):
+def sum_join_outputs(tree, selectivity_map, table_rows, allowed_edges=None, disconnect_penalty=1e6):
     """
-    rows_out = Lrows * Rrows * sel
-    final_rows: 根节点输出行数
-    total_generated_rows: 树内所有 JOIN 的 rows_out 之和（优化/验证用）
-    sel 采用 _sel_min_rule（无配对→1.0）
+    与 GP 版本一致：
+      rows_out = Lrows * Rrows * (Π 跨边选择率)；若跨边无任何边 => rows_out = Lrows * Rrows * disconnect_penalty
+      final_rows: 根节点输出行数（= 根的 rows_out）
+      total_generated_rows: 树内所有 JOIN 的 rows_out 之和（作为优化/验证用）
     """
     if isinstance(tree, str):
         return table_rows.get(tree, 1), 0.0
 
     _, left, right = tree
-    Lrows, Lsum = sum_join_outputs(left,  selectivity_map, table_rows)
-    Rrows, Rsum = sum_join_outputs(right, selectivity_map, table_rows)
+    Lrows, Lsum = sum_join_outputs(left,  selectivity_map, table_rows, allowed_edges, disconnect_penalty)
+    Rrows, Rsum = sum_join_outputs(right, selectivity_map, table_rows, allowed_edges, disconnect_penalty)
 
-    sel = _sel_min_rule(left, right, selectivity_map)
-    rows_out  = Lrows * Rrows * sel
+    # 若上层未传入 allowed_edges，则按当前树涉及的表构建一次（与 GP 的兜底行为一致）
+    if allowed_edges is None:
+        all_tabs = _tabs(tree)
+        allowed_edges = build_allowed_edges(selectivity_map, all_tabs)
+
+    sel = _crossing_selectivity_product(left, right, selectivity_map, allowed_edges)
+    if sel is None:
+        rows_out = Lrows * Rrows * disconnect_penalty
+    else:
+        rows_out = Lrows * Rrows * sel
+        # 注：GP 中的 _anchor_penalty 已改为恒等 1.0，这里无需再乘
+
     total_sum = Lsum + Rsum + rows_out
     return rows_out, total_sum
 
@@ -111,6 +131,9 @@ if __name__ == "__main__":
     REL_TOL = 1e-12
     ABS_TOL = 1e-15
 
+    # 与 GP 一致的断连惩罚
+    DISCONNECT_PENALTY = 1e6  # === CHANGE: 显式设定
+
     for filename, query_info in all_queries.items():
         table_list = list(dict.fromkeys(query_info["FROM"]))
 
@@ -124,6 +147,9 @@ if __name__ == "__main__":
 
         print(f"开始枚举 Query: {filename}  表: {table_list}")
 
+        # === CHANGE: 预构建 allowed_edges，和 GP 一样限定为本查询涉及的表对
+        allowed_edges = build_allowed_edges(selectivity_map, table_list)
+
         all_min_trees = []
         min_cost = float("inf")
 
@@ -132,7 +158,11 @@ if __name__ == "__main__":
             join_trees = generate_all_join_trees(list(perm))
             for tree in join_trees:
                 try:
-                    final_rows, total_sum = sum_join_outputs(tree, selectivity_map, table_rows)
+                    final_rows, total_sum = sum_join_outputs(
+                        tree, selectivity_map, table_rows,
+                        allowed_edges=allowed_edges,                   # === CHANGE
+                        disconnect_penalty=DISCONNECT_PENALTY          # === CHANGE
+                    )
                     cost = total_sum  # 以 Σ rows_out 为代价
                     if cost < min_cost and not math.isclose(cost, min_cost, rel_tol=REL_TOL, abs_tol=ABS_TOL):
                         min_cost = cost
